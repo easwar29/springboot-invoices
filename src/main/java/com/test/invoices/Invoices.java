@@ -1,9 +1,13 @@
 package com.test.invoices;
 
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.test.invoices.domain.CreateOrUpdateInvoiceRequest;
 import com.test.invoices.domain.Customer;
 import com.test.invoices.domain.Invoice;
+import com.test.invoices.domain.InvoiceUpdatedEvent;
 import com.test.invoices.repository.InvoiceRepository;
+import org.springframework.amqp.rabbit.core.RabbitTemplate;
 import org.springframework.web.bind.annotation.*;
 
 import java.util.List;
@@ -20,9 +24,14 @@ public class Invoices {
 
     private final CustomerService customerService;
 
-    public Invoices(InvoiceRepository invoiceRepository, CustomerService customerService) {
+    private final RabbitTemplate rabbitTemplate;
+
+    private final ObjectMapper objectMapper = new ObjectMapper();
+
+    public Invoices(InvoiceRepository invoiceRepository, CustomerService customerService, RabbitTemplate rabbitTemplate) {
         this.invoiceRepository = invoiceRepository;
         this.customerService = customerService;
+        this.rabbitTemplate = rabbitTemplate;
     }
 
 
@@ -41,7 +50,9 @@ public class Invoices {
         invoice.setDescription(createOrUpdateInvoiceRequest.getDescription());
         invoice.setInvoiceId(createOrUpdateInvoiceRequest.getInvoiceId());
         invoice.setCustomerId(createOrUpdateInvoiceRequest.getCustomerId());
-        return invoiceRepository.save(invoice);
+        Invoice savedInvoice = invoiceRepository.save(invoice);
+        publishEvent(savedInvoice);
+        return savedInvoice;
     }
 
     @ResponseStatus(OK)
@@ -53,7 +64,10 @@ public class Invoices {
             return customersForUser.stream()
                     .filter(customer -> customer.getId().equals(invoice.getCustomerId()))
                     .findFirst().orElse(null);
-        }).ifPresent(account -> invoiceRepository.deleteById(id));
+        }).ifPresent(account -> {
+            invoiceRepository.deleteById(id);
+            publishEvent(optionalInvoice.get());
+        });
     }
 
     @ResponseStatus(OK)
@@ -61,7 +75,7 @@ public class Invoices {
     public Invoice updateInvoice(@RequestBody CreateOrUpdateInvoiceRequest createOrUpdateInvoiceRequest,
                                  @PathVariable("id") Long id,
                                  @RequestHeader("X-USER") String user) {
-        return invoiceRepository.findById(id).map(invoice -> {
+        Invoice savedInvoice = invoiceRepository.findById(id).map(invoice -> {
                     List<Customer> customersForUser = customerService.getCustomersForUser(user);
                     return customersForUser.stream()
                             .filter(customer -> customer.getId().equals(invoice.getCustomerId()))
@@ -74,5 +88,20 @@ public class Invoices {
                             }).orElse(null);
                 }
         ).orElse(null);
+        publishEvent(savedInvoice);
+        return savedInvoice;
+    }
+
+    private void publishEvent(Invoice invoice) {
+        try {
+            //TODO RabbitMQ does not guarantee ordering. So this event must contain date as well for the consumer to handle it
+            InvoiceUpdatedEvent invoiceUpdatedEvent = new InvoiceUpdatedEvent();
+            invoiceUpdatedEvent.setAggregatedRevenue(invoiceRepository.sumOfInvoicePurchaseAmountsForCustomer(invoice.getCustomerId()));
+            invoiceUpdatedEvent.setCustomerId(invoice.getCustomerId());
+            String invoiceUpdatedEventString = objectMapper.writeValueAsString(invoiceUpdatedEvent);
+            rabbitTemplate.convertAndSend(Application.topicExchangeName, "invoice.id." + invoice.getId(), invoiceUpdatedEventString);
+        } catch (JsonProcessingException e) {
+            e.printStackTrace();
+        }
     }
 }
